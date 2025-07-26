@@ -1,61 +1,91 @@
-# shim.py ─ minimal bridge between LLMUnity and OpenAI
-import os, json
-from openai import OpenAI
+import json, time
 from flask import Flask, request, jsonify, Response, stream_with_context
+from openai import OpenAI
+import os
+from flask_cors import CORS
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-
 app = Flask(__name__)
+CORS(app,
+     resources={r"/*": {"origins": "*"}},
+     allow_headers=["Content-Type"],
+     methods=["GET", "POST", "OPTIONS"])
 
-# --- tiny helpers -----------------------------------------------------------
-def to_openai_messages(req: dict) -> list[dict]:
-    """
-    Translate the LLMUnity payload into OpenAI's 'messages' list.
-    Expected keys in the request body:
-        prompt   : current user prompt  (string)
-        history  : optional chat history [{'role': 'user'|'assistant', 'content': str}, …]
-    """
-    hist = req.get("history", [])
-    prompt = req.get("prompt") or req.get("query") or req.get("text")
-    if prompt is None:
-        raise ValueError("No prompt in request")
-    return hist + [{"role": "user", "content": prompt}]
+def sse_llama_stream(messages, sampling):
+    for chunk in client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            stream=True,
+            **sampling):
 
-# --- main endpoint ----------------------------------------------------------
-@app.route("/chat", methods=["POST"])
+        tok = chunk.choices[0].delta.content
+        if tok:
+            yield 'data: ' + json.dumps({
+                "index": 0,
+                "content": tok,
+                "stop": False
+            }, ensure_ascii=False) + '\n\n'
+
+    yield 'data: ' + json.dumps({
+        "index": 0,
+        "content": "",
+        "stop": True
+    }) + '\n\n'
+
+
+@app.route("/completion", methods=["POST"])
 def chat():
-    data = request.get_json(force=True)
-    stream = bool(data.get("stream", False))
+    req = request.get_json(force=True)
+    stream = bool(req.get("stream", False))
 
-    messages = to_openai_messages(data)
+    sampling = {
+        "temperature": req.get("temperature", 0.7),
+        "top_p":       req.get("top_p", 1.0),
+        "max_tokens":  req.get("n_predict", 256) if req.get("n_predict", -1) > 0 else None,
+    }
+    messages = req.get("messages") or [{"role":"user", "content": req["prompt"]}]
 
-    # If LLMUnity asked for a streaming reply, proxy the stream token-by-token
     if stream:
-        def gen():
-            for chunk in client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=messages,
-                    temperature=data.get("temperature", 0.7),
-                    stream=True):
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
-        return Response(stream_with_context(gen()), mimetype="text/plain")
+        headers = {
+            "Content-Type":  "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # stops nginx buffering, if any
+        }
+        return Response(stream_with_context(sse_llama_stream(messages, sampling)),
+                            headers=headers)
 
-    # Non-streaming (one-shot) mode
+    # ── non-stream mode ────────────────────────────────────────────────────
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
-        temperature=data.get("temperature", 0.7),
-    )
-    msg = resp.choices[0].message
-    # Return in the flat format LLMUnity expects
-    return jsonify({
-        "role": msg.role,
-        "content": msg.content,
-        "finish_reason": resp.choices[0].finish_reason,
-    })
+        stream=False,
+        **sampling)
+    full = resp.choices[0].message.content
+    return jsonify({"content": full, "stop_reason": resp.choices[0].finish_reason})
+
+
+# ---------------------------------------------------------------------------
+# extra endpoints Unity probes
+@app.route("/template", methods=["POST"])
+def template():
+    # tell Unity to use plain ChatML (`<|im_start|>role\ncontent`)
+    return jsonify({"template": "chatml"})
+
+@app.route("/tokenize", methods=["POST"])
+def tokenize():
+    txt = request.get_json(force=True).get("content", "")
+    # Unity only needs the length; fake token IDs are fine
+    return jsonify({"tokens": list(range(len(txt.split()))) })
+
+@app.route("/detokenize", methods=["POST"])
+def detokenize():
+    toks = request.get_json(force=True).get("tokens", [])
+    return jsonify({"content": " ".join(str(t) for t in toks)})
+
+@app.route("/embeddings", methods=["POST"])
+def embeddings():
+    return jsonify({"embedding": [0.0] * 768})
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

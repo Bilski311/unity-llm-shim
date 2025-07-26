@@ -1,0 +1,5 @@
+{
+  "prompt": "Hi, I'm Dominik. Tell me a long story",
+  "stream": true,
+  "temperature": 0.3
+}
